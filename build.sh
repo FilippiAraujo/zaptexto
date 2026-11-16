@@ -44,7 +44,7 @@ EOF
 codesign --force -s - "$APP"
 
 if [[ "$1" == "--release" ]]; then
-  (cd build && ditto -c -k --keepParent ZapTexto.app ZapTexto.zip)
+  (cd build && ditto -c -k --norsrc --noextattr --noacl --keepParent ZapTexto.app ZapTexto.zip)
   echo "✓ build/ZapTexto.zip"
 else
   pkill -x ZapTexto 2>/dev/null || true
