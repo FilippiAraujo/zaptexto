@@ -23,6 +23,9 @@ struct AudioMsg {
     let date: Date
     let path: String?
     let fromMe: Bool
+    /// Stable id for the cache: chat JID + WhatsApp's message id. Unlike the row id (Z_PK),
+    /// it survives a WhatsApp reinstall/resync.
+    let key: String
 }
 
 final class WADB {
@@ -68,7 +71,8 @@ final class WADB {
     private let audioSelect = """
         SELECT m.Z_PK, m.ZCHATSESSION, c.ZPARTNERNAME,
                COALESCE(gm.ZCONTACTNAME, gm.ZFIRSTNAME, m.ZPUSHNAME),
-               m.ZMESSAGEDATE, mi.ZMEDIALOCALPATH, m.ZISFROMME, c.ZSESSIONTYPE
+               m.ZMESSAGEDATE, mi.ZMEDIALOCALPATH, m.ZISFROMME, c.ZSESSIONTYPE,
+               c.ZCONTACTJID, m.ZSTANZAID
         FROM ZWAMESSAGE m
         JOIN ZWACHATSESSION c ON c.Z_PK = m.ZCHATSESSION
         LEFT JOIN ZWAMEDIAITEM mi ON mi.Z_PK = m.ZMEDIAITEM
@@ -80,6 +84,8 @@ final class WADB {
         var out: [AudioMsg] = []
         query(audioSelect + " " + whereSQL, args) { st in
             let isGroup = sqlite3_column_int64(st, 7) == 1
+            let rowId = sqlite3_column_int64(st, 0)
+            let key = text(st, 9).map { "\(text(st, 8) ?? "")/\($0)" } ?? "row/\(rowId)"
             out.append(AudioMsg(
                 id: sqlite3_column_int64(st, 0),
                 chatId: sqlite3_column_int64(st, 1),
@@ -87,7 +93,8 @@ final class WADB {
                 sender: isGroup ? text(st, 3) : nil,
                 date: Date(timeIntervalSinceReferenceDate: sqlite3_column_double(st, 4)),
                 path: text(st, 5).map { waContainer.appendingPathComponent("Message").appendingPathComponent($0).path },
-                fromMe: sqlite3_column_int64(st, 6) == 1))
+                fromMe: sqlite3_column_int64(st, 6) == 1,
+                key: key))
         }
         return out
     }
@@ -126,33 +133,16 @@ final class WADB {
 // MARK: - Transcrição (Apple Speech, no aparelho)
 
 enum TranscribeError: LocalizedError {
-    case noFFmpeg, convert, locale
-    var errorDescription: String? {
-        switch self {
-        case .noFFmpeg: "ffmpeg não encontrado (brew install ffmpeg)"
-        case .convert: "não consegui converter o áudio"
-        case .locale: "português não disponível no reconhecimento de fala"
-        }
-    }
+    case locale
+    var errorDescription: String? { "português não disponível no reconhecimento de fala" }
 }
 
 actor Transcriber {
-    private let ffmpeg = ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"]
-        .first { FileManager.default.isExecutableFile(atPath: $0) }
-
     func transcribe(path: String) async throws -> String {
-        guard let ffmpeg else { throw TranscribeError.noFFmpeg }
-        let wav = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".wav")
-        defer { try? FileManager.default.removeItem(at: wav) }
-
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: ffmpeg)
-        p.arguments = ["-loglevel", "error", "-y", "-i", path, "-ar", "16000", "-ac", "1", wav.path]
-        p.standardOutput = FileHandle.nullDevice
-        p.standardError = FileHandle.nullDevice
-        try p.run()
-        p.waitUntilExit()
-        guard p.terminationStatus == 0 else { throw TranscribeError.convert }
+        // WhatsApp .opus → PCM, decodificado no próprio app (OggOpus.swift), sem ffmpeg.
+        let pcm = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".caf")
+        defer { try? FileManager.default.removeItem(at: pcm) }
+        try decodeOggOpus(from: URL(fileURLWithPath: path), to: pcm)
 
         guard let locale = await SpeechTranscriber.supportedLocale(equivalentTo: Locale(identifier: "pt-BR"))
         else { throw TranscribeError.locale }
@@ -166,9 +156,45 @@ actor Transcriber {
             for try await r in transcriber.results where r.isFinal { out += String(r.text.characters) }
             return out
         }
-        let file = try AVAudioFile(forReading: wav)
+        let file = try AVAudioFile(forReading: pcm)
         try await analyzer.start(inputAudioFile: file, finishAfterFile: true)
         return try await collector.value.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
+
+// MARK: - Cache
+
+/// Transcrições já feitas, por mensagem. Entradas com mais de 30 dias são descartadas.
+struct TranscriptCache {
+    struct Entry: Codable { let text: String; let at: Date }
+    private var entries: [String: Entry] = [:]
+    private let url: URL
+    private static let maxAge: TimeInterval = 30 * 24 * 3600
+
+    init() {
+        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("ZapTexto", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        url = dir.appendingPathComponent("transcripts.json")
+        // Cache da v1.0, indexado por id de linha (instável): descarta.
+        try? FileManager.default.removeItem(at: dir.appendingPathComponent("transcricoes.json"))
+        if let d = try? Data(contentsOf: url), let e = try? JSONDecoder().decode([String: Entry].self, from: d) {
+            entries = e
+        }
+        prune()
+    }
+
+    subscript(key: String) -> String? { entries[key]?.text }
+
+    mutating func set(_ text: String, for key: String) {
+        entries[key] = Entry(text: text, at: Date())
+        prune()
+        if let d = try? JSONEncoder().encode(entries) { try? d.write(to: url, options: .atomic) }
+    }
+
+    private mutating func prune() {
+        let limit = Date().addingTimeInterval(-Self.maxAge)
+        entries = entries.filter { $0.value.at > limit }
     }
 }
 
@@ -194,25 +220,15 @@ final class Store: ObservableObject {
     let db: WADB
     private let transcriber = Transcriber()
     private var chain: Task<Void, Never>?
-    private var cache: [String: String] = [:]
-    private let cacheURL: URL = {
-        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("ZapTexto", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir.appendingPathComponent("transcricoes.json")
-    }()
+    private var cache = TranscriptCache()
 
-    init(db: WADB) {
-        self.db = db
-        if let d = try? Data(contentsOf: cacheURL),
-           let c = try? JSONDecoder().decode([String: String].self, from: d) { cache = c }
-    }
+    init(db: WADB) { self.db = db }
 
     func enqueue(_ audios: [AudioMsg]) {
         var added = false
         for a in audios where !items.contains(where: { $0.id == a.id }) {
             var item = Item(id: a.id, chat: a.chatName, sender: a.sender, fromMe: a.fromMe, date: a.date)
-            if let t = cache[String(a.id)] {
+            if let t = cache[a.key] {
                 item.text = t
                 item.status = .done
                 items.insert(item, at: 0)
@@ -251,8 +267,7 @@ final class Store: ObservableObject {
             let text = try await transcriber.transcribe(path: path)
             let final = text.isEmpty ? "(sem fala reconhecida)" : text
             update(a.id) { $0.text = final; $0.status = .done }
-            cache[String(a.id)] = final
-            if let d = try? JSONEncoder().encode(cache) { try? d.write(to: cacheURL, options: .atomic) }
+            cache.set(final, for: a.key)
         } catch {
             update(a.id) { $0.status = .failed(error.localizedDescription) }
         }
@@ -261,9 +276,12 @@ final class Store: ObservableObject {
 
 // MARK: - Detecção da conversa aberta
 
-/// Sem Acessibilidade: quando o WhatsApp está em primeiro plano e uma conversa passa de
-/// "N não lidas" para 0, foi você que abriu ela. Áudios que chegam depois nessa mesma
-/// conversa (já aberta) também são transcritos.
+/// Sem Acessibilidade: quando o WhatsApp está em primeiro plano, você mexeu no Mac há pouco
+/// e uma conversa passa de "N não lidas" para 0, foi você que abriu ela aqui. Áudios que
+/// chegam depois nessa mesma conversa (já aberta) também são transcritos.
+///
+/// Em vez de consultar o banco a cada segundo, reage às mudanças nos arquivos do WhatsApp
+/// (FSEvents), com uma checagem de segurança a cada 15 s.
 @MainActor
 final class Watcher {
     let store: Store
@@ -271,19 +289,55 @@ final class Watcher {
     private var prevUnread: [Int64: Int] = [:]
     private var lastMsgId: Int64 = 0
     private var openChat: Int64?
+    private var stream: FSEventStreamRef?
     private var timer: Timer?
+    private var tickScheduled = false
+
+    /// Ler a conversa no celular também zera as não lidas. Se ninguém tocou no teclado/mouse
+    /// do Mac nesse intervalo, não foi aqui.
+    private static let maxIdle: TimeInterval = 20
 
     init(store: Store) { self.store = store }
 
     func start() {
         prevUnread = store.db.unreadCounts()
         lastMsgId = store.db.maxMessageId()
-        timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+
+        var ctx = FSEventStreamContext(version: 0, info: Unmanaged.passUnretained(self).toOpaque(),
+                                       retain: nil, release: nil, copyDescription: nil)
+        let callback: FSEventStreamCallback = { _, info, _, _, _, _ in
+            guard let info else { return }
+            let watcher = Unmanaged<Watcher>.fromOpaque(info).takeUnretainedValue()
+            MainActor.assumeIsolated { watcher.scheduleTick() }
+        }
+        if let s = FSEventStreamCreate(nil, callback, &ctx, [waContainer.path] as CFArray,
+                                       FSEventStreamEventId(kFSEventStreamEventIdSinceNow), 0.3,
+                                       FSEventStreamCreateFlags(kFSEventStreamCreateFlagFileEvents | kFSEventStreamCreateFlagNoDefer)) {
+            FSEventStreamSetDispatchQueue(s, .main)
+            FSEventStreamStart(s)
+            stream = s
+        }
+        timer = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.tick() }
         }
     }
 
     func setOpenChat(_ id: Int64) { openChat = id }
+
+    private func scheduleTick() {
+        guard !tickScheduled else { return }
+        tickScheduled = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+            MainActor.assumeIsolated {
+                self?.tickScheduled = false
+                self?.tick()
+            }
+        }
+    }
+
+    private var secondsSinceUserInput: TimeInterval {
+        CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: CGEventType(rawValue: ~0)!)
+    }
 
     private func tick() {
         let db = store.db
@@ -292,10 +346,12 @@ final class Watcher {
         let waFront = waBundleIDs.contains(NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "")
 
         if enabled && waFront {
-            for (chat, now) in unread where now == 0 {
-                if let before = prevUnread[chat], before > 0 {
-                    openChat = chat
-                    store.enqueue(db.unreadAudios(chat: chat, k: before))
+            if secondsSinceUserInput < Self.maxIdle {
+                for (chat, now) in unread where now == 0 {
+                    if let before = prevUnread[chat], before > 0 {
+                        openChat = chat
+                        store.enqueue(db.unreadAudios(chat: chat, k: before))
+                    }
                 }
             }
             if maxId > lastMsgId, let open = openChat {

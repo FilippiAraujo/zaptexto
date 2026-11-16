@@ -5,13 +5,13 @@
 set -e
 cd "$(dirname "$0")"
 
-VERSION=1.0.0
+VERSION=1.1.0
 APP=build/ZapTexto.app
 rm -rf build && mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
 echo "→ compiling"
 for arch in arm64 x86_64; do
-  swiftc -O main.swift -target $arch-apple-macos26.0 -o build/ZapTexto-$arch 2>&1 | grep -v "warning:" || true
+  swiftc -O main.swift OggOpus.swift -target $arch-apple-macos26.0 -o build/ZapTexto-$arch 2>&1 | grep -v "warning:" || true
   test -f build/ZapTexto-$arch
 done
 lipo -create build/ZapTexto-arm64 build/ZapTexto-x86_64 -output "$APP/Contents/MacOS/ZapTexto"
