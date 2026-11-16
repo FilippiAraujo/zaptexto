@@ -41,7 +41,18 @@ cat > "$APP/Contents/Info.plist" <<EOF
 </dict></plist>
 EOF
 
-codesign --force -s - "$APP"
+# Sign with a stable certificate when available (see scripts/make-signing-cert.sh),
+# so macOS keeps Full Disk Access across builds. Falls back to ad-hoc.
+SIGN_ID="ZapTexto Local Signing"
+SIGN_KC=~/Library/Keychains/zaptexto-signing.keychain-db
+if [[ -f $SIGN_KC ]] && security find-identity -p codesigning $SIGN_KC | grep -q "$SIGN_ID"; then
+  security unlock-keychain -p "$(security find-generic-password -s zaptexto-signing-keychain -w)" $SIGN_KC
+  codesign --force --keychain $SIGN_KC -s "$SIGN_ID" "$APP"
+  echo "→ signed with '$SIGN_ID'"
+else
+  codesign --force -s - "$APP"
+  echo "→ ad-hoc signed (run scripts/make-signing-cert.sh to keep permissions across builds)"
+fi
 
 if [[ "$1" == "--release" ]]; then
   (cd build && ditto -c -k --norsrc --noextattr --noacl --keepParent ZapTexto.app ZapTexto.zip)

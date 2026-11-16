@@ -59,6 +59,8 @@ cd zaptexto
 
 Needs the Xcode command line tools (`xcode-select --install`).
 
+Tip: run `scripts/make-signing-cert.sh` once before building. It creates a local signing certificate so macOS keeps Full Disk Access across rebuilds. Without it, every build is ad-hoc signed and macOS asks again.
+
 ## How it works
 
 ```
